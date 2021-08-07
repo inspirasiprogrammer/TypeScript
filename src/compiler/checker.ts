@@ -11775,7 +11775,7 @@ namespace ts {
             return getReducedType(getApparentType(getReducedType(type)));
         }
 
-        function createUnionOrIntersectionProperty(containingType: UnionOrIntersectionType, name: __String, skipObjectFunctionPropertyAugment?: boolean): Symbol | undefined {
+        function createUnionOrIntersectionProperty(containingType: UnionOrIntersectionType, name: __String, skipObjectFunctionPropertyAugment?: boolean): Symbol | undefined { // candidate
             let singleProp: Symbol | undefined;
             let propSet: ESMap<SymbolId, Symbol> | undefined;
             let indexTypes: Type[] | undefined;
@@ -27380,6 +27380,152 @@ namespace ts {
                     error(errorNode, Diagnostics.Property_0_is_protected_and_only_accessible_through_an_instance_of_class_1_This_is_an_instance_of_class_2, symbolToString(prop), typeToString(enclosingClass), typeToString(type));
                 }
                 return false;
+            }
+            return true;
+        }
+
+        interface DiagnosticInfo {
+            message: DiagnosticMessage;
+            args?:
+                | [string | number]
+                | [string | number, string | number]
+                | [string | number, string | number, string | number]
+                | [string | number, string | number, string | number, string | number];
+        }
+
+        type CheckerResult =
+            | true  // TODO: should not be just `true`, but tagged union
+            | DiagnosticInfo;
+
+        function checkPropertyAccessibilityAtNode(node: Node,
+            isSuper: boolean, writing: boolean,
+            type: Type, prop: Symbol): CheckerResult {
+            const flags = getDeclarationModifierFlagsFromSymbol(prop, writing);
+            // const errorNode = node.kind === SyntaxKind.QualifiedName ? node.right :
+            //     node.kind === SyntaxKind.ImportType ? node :
+            //     node.kind === SyntaxKind.BindingElement && node.propertyName ? node.propertyName : node.name;
+
+            if (isSuper) {
+                // TS 1.0 spec (April 2014): 4.8.2
+                // - In a constructor, instance member function, instance member accessor, or
+                //   instance member variable initializer where this references a derived class instance,
+                //   a super property access is permitted and must specify a public instance member function of the base class.
+                // - In a static member function or static member accessor
+                //   where this references the constructor function object of a derived class,
+                //   a super property access is permitted and must specify a public static member function of the base class.
+                if (languageVersion < ScriptTarget.ES2015) {
+                    if (symbolHasNonMethodDeclaration(prop)) {
+                        return { message: Diagnostics.Only_public_and_protected_methods_of_the_base_class_are_accessible_via_the_super_keyword };
+                        // if (reportError) {
+                        //     error(errorNode, Diagnostics.Only_public_and_protected_methods_of_the_base_class_are_accessible_via_the_super_keyword);
+                        // }
+                        // return false; // ok, error -> return false;
+                    }
+                }
+                if (flags & ModifierFlags.Abstract) {
+                    // A method cannot be accessed in a super property access if the method is abstract.
+                    // This error could mask a private property access error. But, a member
+                    // cannot simultaneously be private and abstract, so this will trigger an
+                    // additional error elsewhere.
+                    return {
+                        message: Diagnostics.Abstract_method_0_in_class_1_cannot_be_accessed_via_super_expression,
+                        args: [symbolToString(prop), typeToString(getDeclaringClass(prop)!)]
+                    };
+                    // if (reportError) {
+                    //     error(errorNode, Diagnostics.Abstract_method_0_in_class_1_cannot_be_accessed_via_super_expression, symbolToString(prop), typeToString(getDeclaringClass(prop)!));
+                    // }
+                    // return false; // ok, error -> return false;
+                }
+            }
+
+            // Referencing abstract properties within their own constructors is not allowed
+            if ((flags & ModifierFlags.Abstract) && symbolHasNonMethodDeclaration(prop) &&
+                (isThisProperty(node) || isThisInitializedObjectBindingExpression(node) || isObjectBindingPattern(node.parent) && isThisInitializedDeclaration(node.parent.parent))) {
+                const declaringClassDeclaration = getClassLikeDeclarationOfSymbol(getParentOfSymbol(prop)!);
+                if (declaringClassDeclaration && isNodeUsedDuringClassInitialization(node)) {
+                    return {
+                        message: Diagnostics.Abstract_property_0_in_class_1_cannot_be_accessed_in_the_constructor,
+                        args: [symbolToString(prop), getTextOfIdentifierOrLiteral(declaringClassDeclaration.name!)]
+                    };
+                    // if (reportError) {
+                    //     error(errorNode, Diagnostics.Abstract_property_0_in_class_1_cannot_be_accessed_in_the_constructor, symbolToString(prop), getTextOfIdentifierOrLiteral(declaringClassDeclaration.name!)); // TODO: GH#18217
+                    // }
+                    // return false; // ok, error -> return false;
+                }
+            }
+
+            // Public properties are otherwise accessible.
+            if (!(flags & ModifierFlags.NonPublicAccessibilityModifier)) {
+                return true;
+            }
+
+            // Property is known to be private or protected at this point
+
+            // Private property is accessible if the property is within the declaring class
+            if (flags & ModifierFlags.Private) {
+                const declaringClassDeclaration = getClassLikeDeclarationOfSymbol(getParentOfSymbol(prop)!)!;
+                if (!isNodeWithinClass(node, declaringClassDeclaration)) {
+                    return {
+                        message: Diagnostics.Property_0_is_private_and_only_accessible_within_class_1,
+                        args: [symbolToString(prop), typeToString(getDeclaringClass(prop)!)]
+                    };
+                    // if (reportError) {
+                    //     error(errorNode, Diagnostics.Property_0_is_private_and_only_accessible_within_class_1, symbolToString(prop), typeToString(getDeclaringClass(prop)!));
+                    // }
+                    // return false; // ok, error -> return false;
+                }
+                return true;
+            }
+
+            // Property is known to be protected at this point
+
+            // All protected properties of a supertype are accessible in a super access
+            if (isSuper) {
+                return true;
+            }
+
+            // Find the first enclosing class that has the declaring classes of the protected constituents
+            // of the property as base classes
+            let enclosingClass = forEachEnclosingClass(node, enclosingDeclaration => {
+                const enclosingClass = getDeclaredTypeOfSymbol(getSymbolOfNode(enclosingDeclaration)!) as InterfaceType;
+                return isClassDerivedFromDeclaringClasses(enclosingClass, prop, writing) ? enclosingClass : undefined;
+            });
+            // A protected property is accessible if the property is within the declaring class or classes derived from it
+            if (!enclosingClass) {
+                // allow PropertyAccessibility if context is in function with this parameter
+                // static member access is disallow
+                let thisParameter: ParameterDeclaration | undefined;
+                if (flags & ModifierFlags.Static || !(thisParameter = getThisParameterFromNodeContext(node)) || !thisParameter.type) {
+                    return {
+                        message: Diagnostics.Property_0_is_protected_and_only_accessible_within_class_1_and_its_subclasses,
+                        args: [symbolToString(prop), typeToString(getDeclaringClass(prop) || type)]
+                    };
+                    // if (reportError) {
+                    //     error(errorNode, Diagnostics.Property_0_is_protected_and_only_accessible_within_class_1_and_its_subclasses, symbolToString(prop), typeToString(getDeclaringClass(prop) || type));
+                    // }
+                    // return false; // ok, error -> return false;
+                }
+
+                const thisType = getTypeFromTypeNode(thisParameter.type);
+                enclosingClass = (((thisType.flags & TypeFlags.TypeParameter) ? getConstraintOfTypeParameter(thisType as TypeParameter) : thisType) as TypeReference).target;
+            }
+            // No further restrictions for static properties
+            if (flags & ModifierFlags.Static) {
+                return true;
+            }
+            if (type.flags & TypeFlags.TypeParameter) {
+                // get the original type -- represented as the type constraint of the 'this' type
+                type = (type as TypeParameter).isThisType ? getConstraintOfTypeParameter(type as TypeParameter)! : getBaseConstraintOfType(type as TypeParameter)!; // TODO: GH#18217 Use a different variable that's allowed to be undefined
+            }
+            if (!type || !hasBaseType(type, enclosingClass)) {
+                return {
+                    message: Diagnostics.Property_0_is_protected_and_only_accessible_through_an_instance_of_class_1_This_is_an_instance_of_class_2,
+                    args: [symbolToString(prop), typeToString(enclosingClass), typeToString(type)]
+                };
+                // if (reportError) {
+                //     error(errorNode, Diagnostics.Property_0_is_protected_and_only_accessible_through_an_instance_of_class_1_This_is_an_instance_of_class_2, symbolToString(prop), typeToString(enclosingClass), typeToString(type));
+                // }
+                // return false; // ok, error -> return false;
             }
             return true;
         }
